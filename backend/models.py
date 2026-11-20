@@ -91,3 +91,52 @@ class Appointment(Base):
         DateTime(timezone=True),
         server_default=func.now()
     )
+
+class BookingSession(Base):
+    __tablename__ = "booking_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    business_id = Column(Integer, ForeignKey("businesses.id"), nullable=False, index=True)
+
+    customer_name = Column(String(150), nullable=True)
+    customer_phone = Column(String(20), nullable=True)
+    appointment_date = Column(Date, nullable=True)
+    appointment_time = Column(Time, nullable=True)
+    reason = Column(String(500), nullable=True)
+
+    status = Column(String(30), nullable=False, default="collecting")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class AppointmentActionSession(Base):
+    __tablename__ = "appointment_action_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True
+    )
+
+    business_id = Column(
+        Integer,
+        ForeignKey("businesses.id"),
+        nullable=False,
+        index=True
+    )
+
+    appointment_id = Column(
+        Integer,
+        ForeignKey("appointments.id"),
+        nullable=True
+    )
+
+    action = Column(String(30), nullable=False)
+    status = Column(String(30), nullable=False, default="collecting")
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )

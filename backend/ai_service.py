@@ -39,3 +39,36 @@ def get_ai_response(message: str) -> str:
     )
 
     return response["message"]["content"]
+
+from datetime import date, timedelta
+from sqlalchemy.orm import Session
+from models import Appointment, Customer
+
+
+def get_tomorrow_appointments(db: Session, business_id: int):
+    tomorrow = date.today() + timedelta(days=1)
+
+    appointments = (
+        db.query(Appointment, Customer)
+        .join(Customer, Appointment.customer_id == Customer.id)
+        .filter(
+            Appointment.business_id == business_id,
+            Appointment.appointment_date == tomorrow,
+            Appointment.status != "cancelled"
+        )
+        .order_by(Appointment.appointment_time)
+        .all()
+    )
+
+    results = []
+
+    for appointment, customer in appointments:
+        results.append({
+            "customer_name": customer.name,
+            "appointment_date": str(appointment.appointment_date),
+            "appointment_time": str(appointment.appointment_time),
+            "reason": appointment.reason,
+            "status": appointment.status
+        })
+
+    return results

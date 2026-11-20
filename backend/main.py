@@ -1,6 +1,11 @@
+from booking_schemas import BookingMessage, BookingResponse
+from booking_service import process_booking
+from datetime import date, timedelta
+from ai_service import get_ai_response, get_tomorrow_appointments
+from sqlalchemy import and_
+from models import Appointment, Customer
 from ai_service import get_ai_response
 from ai_schemas import ChatRequest, ChatResponse
-from ai_service import get_ai_response
 from ai_schemas import ChatRequest, ChatResponse
 from datetime import date
 from models import Appointment
@@ -555,18 +560,73 @@ def cancel_appointment(
             detail="Could not cancel appointment."
         )
 
+
 @app.post("/ai/chat", response_model=ChatResponse)
 def ai_chat(
     chat: ChatRequest,
+    db: Session = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
     try:
-        reply = get_ai_response(chat.message)
+        message = chat.message.lower()
+
+        if "appointment" in message and (
+            "tomorrow" in message or "tomorrow's" in message
+        ):
+            appointments = get_tomorrow_appointments(
+                db=db,
+                business_id=current_user.business_id
+            )
+
+            if appointments:
+                context = (
+                    f"Actual appointments for tomorrow: {appointments}. "
+                    "Answer using only these records. "
+                    "Do not invent additional appointments."
+                )
+            else:
+                context = (
+                    "There are no appointments scheduled for tomorrow "
+                    "in this business database."
+                )
+
+            reply = get_ai_response(
+                f"Customer message: {chat.message}\n\n"
+                f"Database information: {context}"
+            )
+
+        else:
+            reply = get_ai_response(chat.message)
+
         return {"reply": reply}
 
     except Exception as e:
-        print("OLLAMA ERROR:", repr(e))
+        print("AI ERROR:", repr(e))
         raise HTTPException(
             status_code=502,
-            detail="Local AI service is unavailable."
+            detail="AI receptionist service is unavailable."
+        )
+
+@app.post("/ai/book-appointment", response_model=BookingResponse)
+def ai_book_appointment(
+    booking: BookingMessage,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    try:
+        result = process_booking(
+            db=db,
+            user_id=current_user.id,
+            business_id=current_user.business_id,
+            message=booking.message
+        )
+
+        return result
+
+    except Exception as e:
+        db.rollback()
+        print("BOOKING ERROR:", repr(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to process appointment booking."
         )
