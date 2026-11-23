@@ -1,5 +1,5 @@
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class BusinessCreate(BaseModel):
@@ -8,6 +8,14 @@ class BusinessCreate(BaseModel):
     phone_number: str | None = None
     email: str | None = None
     address: str | None = None
+
+
+class BusinessUpdate(BaseModel):
+    business_name: str | None = Field(default=None, min_length=1, max_length=150)
+    business_type: str | None = Field(default=None, max_length=100)
+    phone_number: str | None = Field(default=None, max_length=20)
+    email: str | None = Field(default=None, max_length=150)
+    address: str | None = Field(default=None, max_length=255)
 
 
 class BusinessResponse(BaseModel):

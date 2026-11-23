@@ -1,5 +1,20 @@
+from contextlib import asynccontextmanager
 from faq_service import find_matching_faq, is_business_question
 from appointment_date_utils import is_valid_appointment_date
+from availability_schemas import (
+    HolidayCreate,
+    HolidayResponse,
+    WorkingHourResponse,
+    WorkingHoursUpdate
+)
+from availability_service import (
+    add_business_holiday,
+    get_business_holidays,
+    get_working_hours,
+    remove_business_holiday,
+    replace_working_hours,
+    validate_appointment_slot
+)
 from models import BusinessFAQ
 from faq_schemas import FAQCreate, FAQUpdate, FAQResponse
 from appointment_action_service import (
@@ -21,7 +36,6 @@ from booking_schemas import BookingMessage, BookingResponse
 from booking_service import process_booking
 from datetime import date, timedelta
 from ai_service import get_ai_response, get_tomorrow_appointments
-from sqlalchemy import and_
 from models import Appointment, Customer
 from ai_service import get_ai_response
 from ai_schemas import ChatRequest, ChatResponse
@@ -44,18 +58,103 @@ from dependencies import get_current_user
 from auth import hash_password, verify_password, create_access_token
 from models import User
 from schemas import UserCreate, UserLogin, UserResponse
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler
+)
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
+from logging_config import logger
+
+from conversation_schemas import (
+    ConversationDetail,
+    ConversationPage,
+    ConversationSummary
+)
+from conversation_service import (
+    close_conversation,
+    get_business_conversations,
+    get_conversation_history,
+    get_or_create_active_conversation,
+    save_message
+)
 from database import get_db
 from models import Business
-from schemas import BusinessCreate, BusinessResponse
+from schemas import BusinessCreate, BusinessResponse, BusinessUpdate
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Application startup")
+    try:
+        yield
+    finally:
+        logger.info("Application shutdown")
+
 
 app = FastAPI(
     title="AI Voice Assistant API",
     description="Backend API for our AI business receptionist",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Authorization", "Content-Type"],
+)
+
+
+@app.exception_handler(HTTPException)
+async def log_http_exception(
+    request: Request,
+    exc: HTTPException
+) -> Response:
+    log_method = logger.error if exc.status_code >= 500 else logger.warning
+    log_method(
+        "API error method=%s path=%s status=%s",
+        request.method,
+        request.url.path,
+        exc.status_code
+    )
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def log_validation_error(
+    request: Request,
+    exc: RequestValidationError
+) -> Response:
+    logger.warning(
+        "Request validation failed method=%s path=%s",
+        request.method,
+        request.url.path
+    )
+    return await request_validation_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def log_unhandled_exception(
+    request: Request,
+    exc: Exception
+) -> JSONResponse:
+    logger.error(
+        "Unhandled API exception method=%s path=%s exception_type=%s",
+        request.method,
+        request.url.path,
+        type(exc).__name__
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error."}
+    )
 
 
 @app.get("/")
@@ -135,6 +234,56 @@ def get_business(
     return business
 
 
+@app.put(
+    "/businesses/{business_id}",
+    response_model=BusinessResponse
+)
+def update_business(
+    business_id: int,
+    business_data: BusinessUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    if current_user.business_id != business_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not allowed to access this business."
+        )
+
+    business = db.query(Business).filter(
+        Business.id == business_id
+    ).first()
+
+    if business is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Business not found."
+        )
+
+    updates = business_data.model_dump(
+        exclude_unset=True,
+        exclude_none=True
+    )
+
+    for field, value in updates.items():
+        setattr(business, field, value)
+
+    try:
+        db.commit()
+        db.refresh(business)
+        return business
+    except Exception as error:
+        db.rollback()
+        logger.error(
+            "Business update failed exception_type=%s",
+            type(error).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Could not update business."
+        )
+
+
 # Register a new user
 @app.post("/auth/register", response_model=UserResponse, status_code=201)
 def register_user(
@@ -199,6 +348,7 @@ def login_user(
         credentials.password,
         user.password_hash
     ):
+        logger.warning("Authentication failed reason=invalid_credentials")
         raise HTTPException(
             status_code=401,
             detail="Invalid email or password."
@@ -391,18 +541,16 @@ def create_appointment(
             detail="Customer not found."
         )
 
-    # Check whether this time slot is already booked
-    existing = db.query(Appointment).filter(
-        Appointment.business_id == current_user.business_id,
-        Appointment.appointment_date == appointment.appointment_date,
-        Appointment.appointment_time == appointment.appointment_time,
-        Appointment.status != "cancelled"
-    ).first()
-
-    if existing:
+    availability_error = validate_appointment_slot(
+        db=db,
+        business_id=current_user.business_id,
+        appointment_date=appointment.appointment_date,
+        appointment_time=appointment.appointment_time
+    )
+    if availability_error:
         raise HTTPException(
             status_code=409,
-            detail="This appointment slot is already booked."
+            detail=availability_error
         )
 
     new_appointment = Appointment(
@@ -418,10 +566,19 @@ def create_appointment(
         db.add(new_appointment)
         db.commit()
         db.refresh(new_appointment)
+        logger.info(
+            "Appointment created business_id=%s appointment_id=%s",
+            current_user.business_id,
+            new_appointment.id
+        )
         return new_appointment
 
-    except Exception:
+    except Exception as error:
         db.rollback()
+        logger.error(
+            "Appointment create failed exception_type=%s",
+            type(error).__name__
+        )
         raise HTTPException(
             status_code=500,
             detail="Could not create appointment."
@@ -499,7 +656,10 @@ def update_appointment(
             detail="Only confirmed appointments can be updated."
         )
 
-    updates = appointment_data.model_dump(exclude_unset=True)
+    updates = appointment_data.model_dump(
+        exclude_unset=True,
+        exclude_none=True
+    )
 
     new_date = updates.get(
         "appointment_date",
@@ -510,20 +670,22 @@ def update_appointment(
         appointment.appointment_time
     )
 
-    # Check whether the new slot is occupied by another appointment
-    existing = db.query(Appointment).filter(
-        Appointment.business_id == current_user.business_id,
-        Appointment.appointment_date == new_date,
-        Appointment.appointment_time == new_time,
-        Appointment.status != "cancelled",
-        Appointment.id != appointment_id
-    ).first()
-
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail="The new appointment slot is already booked."
+    if (
+        "appointment_date" in updates
+        or "appointment_time" in updates
+    ):
+        availability_error = validate_appointment_slot(
+            db=db,
+            business_id=current_user.business_id,
+            appointment_date=new_date,
+            appointment_time=new_time,
+            exclude_appointment_id=appointment_id
         )
+        if availability_error:
+            raise HTTPException(
+                status_code=409,
+                detail=availability_error
+            )
 
     for field, value in updates.items():
         setattr(appointment, field, value)
@@ -531,10 +693,23 @@ def update_appointment(
     try:
         db.commit()
         db.refresh(appointment)
+        if (
+            "appointment_date" in updates
+            or "appointment_time" in updates
+        ):
+            logger.info(
+                "Appointment rescheduled business_id=%s appointment_id=%s",
+                current_user.business_id,
+                appointment.id
+            )
         return appointment
 
-    except Exception:
+    except Exception as error:
         db.rollback()
+        logger.error(
+            "Appointment update failed exception_type=%s",
+            type(error).__name__
+        )
         raise HTTPException(
             status_code=500,
             detail="Could not update appointment."
@@ -567,16 +742,142 @@ def cancel_appointment(
 
     try:
         db.commit()
+        logger.info(
+            "Appointment cancelled business_id=%s appointment_id=%s",
+            current_user.business_id,
+            appointment.id
+        )
 
         return {
             "message": "Appointment cancelled successfully."
         }
 
-    except Exception:
+    except Exception as error:
         db.rollback()
+        logger.error(
+            "Appointment cancellation failed exception_type=%s",
+            type(error).__name__
+        )
         raise HTTPException(
             status_code=500,
             detail="Could not cancel appointment."
+        )
+
+
+@app.get(
+    "/business/working-hours",
+    response_model=list[WorkingHourResponse]
+)
+def list_working_hours(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    return get_working_hours(db, current_user.business_id)
+
+
+@app.put(
+    "/business/working-hours",
+    response_model=list[WorkingHourResponse]
+)
+def set_working_hours(
+    schedule: WorkingHoursUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    try:
+        working_hours = replace_working_hours(
+            db=db,
+            business_id=current_user.business_id,
+            working_hours=schedule.working_hours
+        )
+        db.commit()
+        return working_hours
+    except Exception as error:
+        db.rollback()
+        logger.error(
+            "Working hours update failed exception_type=%s",
+            type(error).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Could not update working hours."
+        )
+
+
+@app.get(
+    "/business/holidays",
+    response_model=list[HolidayResponse]
+)
+def list_business_holidays(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    return get_business_holidays(db, current_user.business_id)
+
+
+@app.post(
+    "/business/holidays",
+    response_model=HolidayResponse,
+    status_code=201
+)
+def create_business_holiday(
+    holiday: HolidayCreate,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    try:
+        new_holiday = add_business_holiday(
+            db=db,
+            business_id=current_user.business_id,
+            holiday_date=holiday.holiday_date,
+            name=holiday.name
+        )
+        db.commit()
+        db.refresh(new_holiday)
+        return new_holiday
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A holiday is already configured for that date."
+        )
+    except Exception as error:
+        db.rollback()
+        logger.error(
+            "Holiday creation failed exception_type=%s",
+            type(error).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create holiday."
+        )
+
+
+@app.delete("/business/holidays/{holiday_id}")
+def delete_business_holiday(
+    holiday_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    if not remove_business_holiday(
+        db=db,
+        business_id=current_user.business_id,
+        holiday_id=holiday_id
+    ):
+        raise HTTPException(status_code=404, detail="Holiday not found.")
+
+    try:
+        db.commit()
+        return {"message": "Holiday deleted successfully."}
+    except Exception as error:
+        db.rollback()
+        logger.error(
+            "Holiday deletion failed exception_type=%s",
+            type(error).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Could not delete holiday."
         )
 
 
@@ -695,6 +996,66 @@ def delete_faq(
 
 
 
+@app.get("/conversations", response_model=ConversationPage)
+def list_conversations(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    return get_business_conversations(
+        db=db,
+        business_id=current_user.business_id,
+        limit=limit,
+        offset=offset
+    )
+
+
+@app.get(
+    "/conversations/{conversation_id}",
+    response_model=ConversationDetail
+)
+def read_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    history = get_conversation_history(
+        db=db,
+        conversation_id=conversation_id,
+        business_id=current_user.business_id
+    )
+
+    if history is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return history
+
+
+@app.patch(
+    "/conversations/{conversation_id}/close",
+    response_model=ConversationSummary
+)
+def complete_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    conversation = close_conversation(
+        db=db,
+        conversation_id=conversation_id,
+        business_id=current_user.business_id
+    )
+
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    db.commit()
+    db.refresh(conversation)
+
+    return conversation
+
+
 @app.post("/ai/chat", response_model=ChatResponse)
 def ai_chat(
     chat: ChatRequest,
@@ -705,6 +1066,48 @@ def ai_chat(
         import re
 
         message = chat.message.strip()
+        if not message:
+            raise HTTPException(
+                status_code=422,
+                detail="Message cannot be empty."
+            )
+
+        if chat.customer_id is not None:
+            customer_exists = db.query(Customer.id).filter(
+                Customer.id == chat.customer_id,
+                Customer.business_id == current_user.business_id
+            ).first()
+
+            if customer_exists is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Customer not found."
+                )
+
+        conversation = get_or_create_active_conversation(
+            db=db,
+            business_id=current_user.business_id,
+            customer_id=chat.customer_id,
+            channel="chat"
+        )
+        save_message(
+            db=db,
+            conversation_id=conversation.id,
+            role="user",
+            content=message
+        )
+        db.commit()
+
+        def reply_with_history(reply: str):
+            save_message(
+                db=db,
+                conversation_id=conversation.id,
+                role="assistant",
+                content=reply
+            )
+            db.commit()
+            return {"reply": reply}
+
         lower_message = message.lower()
 
         # ==========================================
@@ -726,9 +1129,9 @@ def ai_chat(
 
         booking_intent = (
             "appointment" in lower_message
-            and any(
-                word in lower_message
-                for word in ["book", "booking", "schedule", "want"]
+            and re.search(
+                r"\b(?:book|booking|schedule|want)\b",
+                lower_message
             )
         )
 
@@ -740,7 +1143,7 @@ def ai_chat(
                 message=message
             )
 
-            return {"reply": result["reply"]}
+            return reply_with_history(result["reply"])
 
         # ==========================================
         # 2. FIND ACTIVE ACTION SESSION
@@ -775,13 +1178,13 @@ def ai_chat(
                     business_id=current_user.business_id
                 )
 
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         "Your appointment has been cancelled successfully."
                         if success
                         else "I couldn't cancel the appointment."
                     )
-                }
+                )
 
             if active_session.action == "reschedule":
                 success = update_appointment_after_confirmation(
@@ -793,13 +1196,13 @@ def ai_chat(
                     new_time=active_session.new_appointment_time
                 )
 
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         "Your appointment has been rescheduled successfully."
                         if success
                         else "I couldn't reschedule that appointment. Please check availability."
                     )
-                }
+                )
 
         # ==========================================
         # 4. HANDLE NO CONFIRMATION
@@ -811,12 +1214,12 @@ def ai_chat(
             active_session.status = "cancelled"
             db.commit()
 
-            return {
-                "reply": (
+            return reply_with_history(
+                (
                     "Your request has been cancelled. "
                     "Your existing appointment remains unchanged."
                 )
-            }
+            )
 
         # ==========================================
         # 5. COLLECT RESCHEDULE DATE AND TIME
@@ -853,13 +1256,13 @@ def ai_chat(
                             "new time, for example 10 AM"
                         )
 
-                    return {
-                        "reply": (
+                    return reply_with_history(
+                        (
                             "Please provide your "
                             + " and ".join(missing)
                             + "."
                         )
-                    }
+                    )
 
                 new_date = active_session.new_appointment_date
                 new_time = active_session.new_appointment_time
@@ -869,52 +1272,48 @@ def ai_chat(
                     active_session.new_appointment_time = None
                     db.commit()
 
-                    return {
-                        "reply": (
+                    return reply_with_history(
+                        (
                             "That date is in the past. "
                             "Please provide a future date and time."
                         )
-                    }
+                    )
 
-                existing = db.query(Appointment).filter(
-                    Appointment.business_id == current_user.business_id,
-                    Appointment.appointment_date == new_date,
-                    Appointment.appointment_time == new_time,
-                    Appointment.status == "confirmed",
-                    Appointment.id != active_session.appointment_id
-                ).first()
-
-                if existing:
+                availability_error = validate_appointment_slot(
+                    db=db,
+                    business_id=current_user.business_id,
+                    appointment_date=new_date,
+                    appointment_time=new_time,
+                    exclude_appointment_id=active_session.appointment_id
+                )
+                if availability_error:
                     active_session.new_appointment_date = None
                     active_session.new_appointment_time = None
                     db.commit()
 
-                    return {
-                        "reply": (
-                            "That time slot is already booked. "
-                            "Please provide another date and time."
-                        )
-                    }
+                    return reply_with_history(
+                        availability_error
+                    )
 
                 active_session.status = "awaiting_confirmation"
                 db.commit()
 
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         f"Your proposed appointment time is "
                         f"{new_date} at {new_time}. "
                         "Would you like to confirm this change? "
                         "Reply YES or NO."
                     )
-                }
+                )
 
             if active_session.status == "awaiting_confirmation":
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         "Please reply YES to confirm the rescheduling "
                         "or NO to keep your existing appointment."
                     )
-                }
+                )
 
         # ==========================================
         # 6. START RESCHEDULING REQUEST
@@ -925,12 +1324,12 @@ def ai_chat(
             phone_match = re.search(r"\b[6-9]\d{9}\b", message)
 
             if not phone_match:
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         "Please provide the registered "
                         "10-digit phone number for your appointment."
                     )
-                }
+                )
 
             appointments = find_customer_appointments(
                 db=db,
@@ -939,12 +1338,12 @@ def ai_chat(
             )
 
             if not appointments:
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         "I couldn't find an upcoming confirmed "
                         "appointment for that phone number."
                     )
-                }
+                )
 
             if len(appointments) > 1:
                 details = "\n".join(
@@ -954,13 +1353,13 @@ def ai_chat(
                     for a in appointments
                 )
 
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         "I found multiple appointments. Please contact "
                         "the receptionist to select the correct appointment:\n"
                         + details
                     )
-                }
+                )
 
             appointment = appointments[0]
 
@@ -972,18 +1371,18 @@ def ai_chat(
             )
 
             if session is None:
-                return {
-                    "reply": "I couldn't start the rescheduling request."
-                }
+                return reply_with_history(
+                    "I couldn't start the rescheduling request."
+                )
 
-            return {
-                "reply": (
+            return reply_with_history(
+                (
                     f"I found your appointment on "
                     f"{appointment['appointment_date']} "
                     f"at {appointment['appointment_time']}. "
                     "What new date and time would you prefer?"
                 )
-            }
+            )
 
         # ==========================================
         # 7. START CANCELLATION REQUEST
@@ -994,12 +1393,12 @@ def ai_chat(
             phone_match = re.search(r"\b[6-9]\d{9}\b", message)
 
             if not phone_match:
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         "Please provide the registered "
                         "10-digit phone number."
                     )
-                }
+                )
 
             appointments = find_customer_appointments(
                 db=db,
@@ -1008,20 +1407,20 @@ def ai_chat(
             )
 
             if not appointments:
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         "No upcoming confirmed appointments were found."
                     )
-                }
+                )
 
             if len(appointments) > 1:
-                return {
-                    "reply": (
+                return reply_with_history(
+                    (
                         "Multiple appointments were found. "
                         "Please contact the receptionist to select "
                         "the correct appointment."
                     )
-                }
+                )
 
             appointment = appointments[0]
 
@@ -1032,15 +1431,15 @@ def ai_chat(
                 appointment_id=appointment["appointment_id"]
             )
 
-            return {
-                "reply": (
+            return reply_with_history(
+                (
                     f"Appointment found for "
                     f"{appointment['customer_name']} on "
                     f"{appointment['appointment_date']} at "
                     f"{appointment['appointment_time']}. "
                     "Reply YES to cancel or NO to keep it."
                 )
-            }
+            )
 
         # ==========================================
         # 8. TOMORROW APPOINTMENT ENQUIRY
@@ -1065,7 +1464,7 @@ def ai_chat(
                 f"Database information: {context}"
             )
 
-            return {"reply": reply}
+            return reply_with_history(reply)
 
         # ==========================================
         # 9. CHECK BUSINESS FAQs
@@ -1078,21 +1477,19 @@ def ai_chat(
         )
 
         if matched_faq:
-            return {
-                "reply": matched_faq.answer
-            }
+            return reply_with_history(matched_faq.answer)
 
         # ==========================================
         # 10. SAFE BUSINESS INFORMATION FALLBACK
         # ==========================================
 
         if is_business_question(message):
-            return {
-                "reply": (
+            return reply_with_history(
+                (
                     "I don't have verified information about that yet. "
                     "Please contact our receptionist for assistance."
                 )
-            }
+            )
 
         # ==========================================
         # 11. NORMAL AI CONVERSATION
@@ -1100,12 +1497,19 @@ def ai_chat(
 
         reply = get_ai_response(message)
 
-        return {"reply": reply}
+        return reply_with_history(reply)
 
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
 
-        print("AI ERROR:", repr(e))
+        logger.error(
+            "AI chat failed business_id=%s exception_type=%s",
+            current_user.business_id,
+            type(e).__name__
+        )
 
         raise HTTPException(
             status_code=502,
@@ -1132,7 +1536,11 @@ def ai_book_appointment(
 
     except Exception as e:
         db.rollback()
-        print("BOOKING ERROR:", repr(e))
+        logger.error(
+            "AI booking failed business_id=%s exception_type=%s",
+            current_user.business_id,
+            type(e).__name__
+        )
         raise HTTPException(
             status_code=500,
             detail="Unable to process appointment booking."

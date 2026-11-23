@@ -20,4 +20,15 @@ if "last_activity_at" not in columns:
             "NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ))
 
+conversation_columns = {
+    column["name"]
+    for column in inspect(engine).get_columns("conversations")
+}
+
+if "summary" not in conversation_columns:
+    with engine.begin() as connection:
+        connection.execute(text(
+            "ALTER TABLE conversations ADD COLUMN summary TEXT NULL"
+        ))
+
 print("Database tables created successfully!")

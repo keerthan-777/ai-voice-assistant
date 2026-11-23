@@ -3,11 +3,14 @@ from datetime import datetime, date, timedelta, time
 
 from sqlalchemy.orm import Session
 
+from availability_service import validate_appointment_slot
 from appointment_date_utils import (
     is_valid_appointment_date,
     parse_appointment_date,
 )
+from appointment_time_utils import parse_appointment_time
 from models import BookingSession, Appointment, Customer
+from logging_config import logger
 
 
 
@@ -28,43 +31,7 @@ def extract_phone(message: str):
 
 
 def extract_time(message: str):
-    text = message.strip().lower()
-
-    # 12-hour format: 10 AM, 2:30 PM
-    match = re.search(
-        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
-        text,
-        re.IGNORECASE
-    )
-
-    if match:
-        hour = int(match.group(1))
-        minute = int(match.group(2) or 0)
-        period = match.group(3).lower()
-
-        if hour < 1 or hour > 12 or minute > 59:
-            return None
-
-        if period == "pm" and hour != 12:
-            hour += 12
-        elif period == "am" and hour == 12:
-            hour = 0
-
-        return time(hour, minute)
-
-    # 24-hour format: 14:00, 09:30, 18:45
-    match = re.search(
-        r"\b([01]?\d|2[0-3]):([0-5]\d)\b",
-        text
-    )
-
-    if match:
-        hour = int(match.group(1))
-        minute = int(match.group(2))
-
-        return time(hour, minute)
-
-    return None
+    return parse_appointment_time(message, search=True)
 
 
 
@@ -175,7 +142,7 @@ def process_booking(
         if date_match:
             new_date = extract_date(date_match.group(1))
 
-            if not is_valid_appointment_date(new_date):
+            if not is_valid_appointment_date(new_date, allow_today=True):
                 return {
                     "reply": (
                         "Please provide a valid future date, such as "
@@ -248,6 +215,20 @@ def process_booking(
             phone_match,
             reason_match
         ]):
+            if time_match or date_match:
+                availability_error = validate_appointment_slot(
+                    db=db,
+                    business_id=business_id,
+                    appointment_date=booking.appointment_date,
+                    appointment_time=booking.appointment_time
+                )
+                if availability_error:
+                    db.rollback()
+                    return {
+                        "reply": availability_error,
+                        "status": "awaiting_confirmation"
+                    }
+
             db.commit()
 
             return {
@@ -278,6 +259,22 @@ def process_booking(
                 "status": "awaiting_confirmation"
             }
 
+        availability_error = validate_appointment_slot(
+            db=db,
+            business_id=business_id,
+            appointment_date=booking.appointment_date,
+            appointment_time=booking.appointment_time
+        )
+        if availability_error:
+            booking.status = "collecting"
+            booking.appointment_date = None
+            booking.appointment_time = None
+            db.commit()
+            return {
+                "reply": availability_error,
+                "status": "collecting"
+            }
+
         # Find or create customer
         customer = db.query(Customer).filter(
             Customer.business_id == business_id,
@@ -293,24 +290,6 @@ def process_booking(
             db.add(customer)
             db.flush()
 
-        # Check whether requested slot is already booked
-        existing = db.query(Appointment).filter(
-            Appointment.business_id == business_id,
-            Appointment.appointment_date == booking.appointment_date,
-            Appointment.appointment_time == booking.appointment_time,
-            Appointment.status != "cancelled"
-        ).first()
-
-        if existing:
-            booking.status = "collecting"
-            booking.appointment_time = None
-            db.commit()
-
-            return {
-                "reply": "Sorry, this time is already booked. Please choose another time.",
-                "status": "collecting"
-            }
-
         # Save appointment
         appointment = Appointment(
             customer_id=customer.id,
@@ -324,6 +303,11 @@ def process_booking(
         db.add(appointment)
         booking.status = "completed"
         db.commit()
+        logger.info(
+            "Appointment created business_id=%s appointment_id=%s",
+            business_id,
+            appointment.id
+        )
 
         return {
             "reply": "Your appointment has been successfully booked!",
@@ -374,10 +358,13 @@ def process_booking(
     if booking.appointment_date is None:
         appointment_date = extract_date(message)
 
-        if not is_valid_appointment_date(appointment_date):
+        if not is_valid_appointment_date(
+            appointment_date,
+            allow_today=True
+        ):
             return {
                 "reply": (
-                    "Please provide a valid future date, such as tomorrow, "
+                    "Please provide today or a valid future date, such as "
                     "25-11-2026, 25/11/2026, or November 25."
                 ),
                 "status": "collecting"
@@ -397,7 +384,22 @@ def process_booking(
 
         if not appointment_time:
             return {
-                "reply": "Please provide a valid time, such as 10 AM or 2:30 PM.",
+                "reply": (
+                    "Please provide a valid time, such as 10:30 AM, "
+                    "2:00 PM, 10:30, or 14:00."
+                ),
+                "status": "collecting"
+            }
+
+        availability_error = validate_appointment_slot(
+            db=db,
+            business_id=business_id,
+            appointment_date=booking.appointment_date,
+            appointment_time=appointment_time
+        )
+        if availability_error:
+            return {
+                "reply": availability_error,
                 "status": "collecting"
             }
 

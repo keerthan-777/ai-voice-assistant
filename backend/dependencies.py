@@ -7,6 +7,7 @@ import jwt
 from database import get_db
 from models import User
 from auth import SECRET_KEY, ALGORITHM
+from logging_config import logger
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
@@ -36,11 +37,13 @@ def get_current_user(
         user_id = int(user_id)
 
     except (jwt.InvalidTokenError, ValueError, TypeError):
+        logger.warning("Authentication failed reason=invalid_token")
         raise credentials_exception
 
     user = db.query(User).filter(User.id == user_id).first()
 
     if user is None:
+        logger.warning("Authentication failed reason=user_not_found")
         raise credentials_exception
 
     return user

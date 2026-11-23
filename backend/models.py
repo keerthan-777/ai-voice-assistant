@@ -1,6 +1,19 @@
 
-from sqlalchemy import Date, Time
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean,  Text
+from datetime import datetime
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    Time,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
 
@@ -109,8 +122,8 @@ class BookingSession(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_activity_at = Column(
         DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
+        default=datetime.now,
+        onupdate=datetime.now,
         nullable=False
     )
 
@@ -180,6 +193,58 @@ class BusinessFAQ(Base):
         server_default=func.now()
     )
 
+
+class BusinessWorkingHour(Base):
+    __tablename__ = "business_working_hours"
+    __table_args__ = (
+        UniqueConstraint(
+            "business_id",
+            "weekday",
+            name="uq_business_working_hours_weekday"
+        ),
+        CheckConstraint(
+            "weekday >= 0 AND weekday <= 6",
+            name="ck_business_working_hours_weekday"
+        ),
+        CheckConstraint(
+            "open_time < close_time",
+            name="ck_business_working_hours_time_range"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_id = Column(
+        Integer,
+        ForeignKey("businesses.id"),
+        nullable=False,
+        index=True
+    )
+    weekday = Column(Integer, nullable=False)
+    open_time = Column(Time, nullable=False)
+    close_time = Column(Time, nullable=False)
+
+
+class BusinessHoliday(Base):
+    __tablename__ = "business_holidays"
+    __table_args__ = (
+        UniqueConstraint(
+            "business_id",
+            "holiday_date",
+            name="uq_business_holidays_date"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_id = Column(
+        Integer,
+        ForeignKey("businesses.id"),
+        nullable=False,
+        index=True
+    )
+    holiday_date = Column(Date, nullable=False)
+    name = Column(String(120), nullable=True)
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
@@ -215,6 +280,7 @@ class Conversation(Base):
         onupdate=func.now(),
         nullable=False
     )
+    summary = Column(Text, nullable=True)
 
 
 class ConversationMessage(Base):

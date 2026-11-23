@@ -1,6 +1,14 @@
+import re
 from datetime import date
-
 from sqlalchemy.orm import Session
+
+from appointment_date_utils import (
+    is_valid_appointment_date,
+    parse_appointment_date,
+)
+from appointment_time_utils import parse_appointment_time
+from availability_service import validate_appointment_slot
+from logging_config import logger
 from models import Appointment, Customer, AppointmentActionSession
 
 
@@ -104,14 +112,12 @@ def confirm_cancellation(
     session.status = "completed"
 
     db.commit()
+    logger.info(
+        "Appointment cancelled business_id=%s appointment_id=%s",
+        business_id,
+        appointment.id
+    )
     return True
-
-import re
-from datetime import date, datetime, time
-from appointment_date_utils import (
-    is_valid_appointment_date,
-    parse_appointment_date,
-)
 
 
 def extract_reschedule_date(message: str):
@@ -119,28 +125,7 @@ def extract_reschedule_date(message: str):
 
 
 def extract_reschedule_time(message: str):
-    match = re.search(
-        r"\b(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\b",
-        message,
-        re.IGNORECASE
-    )
-
-    if not match:
-        return None
-
-    hour = int(match.group(1))
-    minute = int(match.group(2) or 0)
-    period = match.group(3).upper()
-
-    if hour < 1 or hour > 12 or minute > 59:
-        return None
-
-    if period == "PM" and hour != 12:
-        hour += 12
-    elif period == "AM" and hour == 12:
-        hour = 0
-
-    return time(hour, minute)
+    return parse_appointment_time(message, search=True)
 
 
 def update_appointment_after_confirmation(
@@ -171,18 +156,18 @@ def update_appointment_after_confirmation(
         db.commit()
         return False
 
-    if not is_valid_appointment_date(new_date, allow_today=True):
-        return False
-
-    existing = db.query(Appointment).filter(
-        Appointment.business_id == business_id,
-        Appointment.appointment_date == new_date,
-        Appointment.appointment_time == new_time,
-        Appointment.status == "confirmed",
-        Appointment.id != appointment.id
-    ).first()
-
-    if existing:
+    availability_error = validate_appointment_slot(
+        db=db,
+        business_id=business_id,
+        appointment_date=new_date,
+        appointment_time=new_time,
+        exclude_appointment_id=appointment.id
+    )
+    if availability_error:
+        session.status = "collecting"
+        session.new_appointment_date = None
+        session.new_appointment_time = None
+        db.commit()
         return False
 
     appointment.appointment_date = new_date
@@ -190,6 +175,11 @@ def update_appointment_after_confirmation(
     session.status = "completed"
 
     db.commit()
+    logger.info(
+        "Appointment rescheduled business_id=%s appointment_id=%s",
+        business_id,
+        appointment.id
+    )
     return True
 
 def create_reschedule_session(
@@ -238,7 +228,17 @@ def save_reschedule_details(
     if new_date is None or new_time is None:
         return False
 
-    if new_date < date.today():
+    if not is_valid_appointment_date(new_date, allow_today=True):
+        return False
+
+    availability_error = validate_appointment_slot(
+        db=db,
+        business_id=session.business_id,
+        appointment_date=new_date,
+        appointment_time=new_time,
+        exclude_appointment_id=session.appointment_id
+    )
+    if availability_error:
         return False
 
     session.new_appointment_date = new_date
@@ -246,4 +246,9 @@ def save_reschedule_details(
     session.status = "awaiting_confirmation"
 
     db.commit()
+    logger.info(
+        "Appointment rescheduled business_id=%s appointment_id=%s",
+        business_id,
+        appointment.id
+    )
     return True
