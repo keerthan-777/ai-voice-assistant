@@ -1,6 +1,6 @@
 
 from sqlalchemy import Date, Time
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean,  Text
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
 
@@ -107,6 +107,12 @@ class BookingSession(Base):
 
     status = Column(String(30), nullable=False, default="collecting")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_activity_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False
+    )
 
 class AppointmentActionSession(Base):
     __tablename__ = "appointment_action_sessions"
@@ -135,8 +141,100 @@ class AppointmentActionSession(Base):
 
     action = Column(String(30), nullable=False)
     status = Column(String(30), nullable=False, default="collecting")
+    new_appointment_date = Column(Date, nullable=True)
+    new_appointment_time = Column(Time, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+    last_activity_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False
+    )
+
+class BusinessFAQ(Base):
+    __tablename__ = "business_faqs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    business_id = Column(
+        Integer,
+        ForeignKey("businesses.id"),
+        nullable=False,
+        index=True
+    )
+
+    question = Column(String(500), nullable=False)
+    answer = Column(String(2000), nullable=False)
+
+    is_active = Column(
+        Boolean,
+        nullable=False,
+        default=True
+    )
 
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now()
+    )
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    business_id = Column(
+        Integer,
+        ForeignKey("businesses.id"),
+        nullable=False,
+        index=True
+    )
+
+    customer_id = Column(
+        Integer,
+        ForeignKey("customers.id"),
+        nullable=True,
+        index=True
+    )
+
+    status = Column(String(30), nullable=False, default="active")
+
+    channel = Column(String(30), nullable=False, default="chat")
+
+    started_at = Column(
+        DateTime,
+        server_default=func.now(),
+        nullable=False
+    )
+
+    last_message_at = Column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False
+    )
+
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    conversation_id = Column(
+        Integer,
+        ForeignKey("conversations.id"),
+        nullable=False,
+        index=True
+    )
+
+    role = Column(String(20), nullable=False)
+
+    content = Column(Text, nullable=False)
+
+    created_at = Column(
+        DateTime,
+        server_default=func.now(),
+        nullable=False
     )
